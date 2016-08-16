@@ -12,6 +12,9 @@ LOGGER = logging.getLogger(__name__)
 LOGGER.addHandler(logging.StreamHandler())
 LOGGER.setLevel(logging.INFO)
 
+MAX_SYNC_TIME = 120.0  # Maximum time, in seconds (float), to wait for synchronous events.
+SYNC_WAIT_TIME = 15.0  # Duration to wait before retrying (or giving up).
+
 def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA):
     # helper function base64 encode for jose spec
     def _b64(b):
@@ -113,14 +116,22 @@ def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA):
 
         # check that the file is in place
         wellknown_url = "http://{0}/.well-known/acme-challenge/{1}".format(domain, token)
-        try:
-            resp = urlopen(wellknown_url)
-            resp_data = resp.read().decode('utf8').strip()
-            assert resp_data == keyauthorization
-        except (IOError, AssertionError):
-            os.remove(wellknown_path)
-            raise ValueError("Wrote file to {0}, but couldn't download {1}".format(
-                wellknown_path, wellknown_url))
+        max_time = MAX_SYNC_TIME + time.time()
+        while (max_time > time.time() and max_time - time.time() < MAX_SYNC_TIME):  # time could step due to external correction
+            try:
+                resp = urlopen(wellknown_url)
+                resp_data = resp.read().decode('utf8').strip()
+                assert resp_data == keyauthorization
+                max_time = False
+                break
+            except (IOError, AssertionError):
+                log.info("Spinning on challenge syncing to {}".format(wellknown_url))
+                time.sleep(SYNC_WAIT_TIME)
+ 
+        if max_time != False:
+                os.remove(wellknown_path)
+                raise ValueError("Wrote file to {0}, but couldn't download {1}".format(
+                    wellknown_path, wellknown_url))
 
         # notify challenge are met
         code, result = _send_signed_request(challenge['uri'], {
@@ -131,7 +142,7 @@ def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA):
             raise ValueError("Error triggering challenge: {0} {1}".format(code, result))
 
         # wait for challenge to be verified
-        while True:
+        while 1: # True / loop forever.
             try:
                 resp = urlopen(challenge['uri'])
                 challenge_status = json.loads(resp.read().decode('utf8'))
@@ -139,7 +150,8 @@ def get_crt(account_key, csr, acme_dir, log=LOGGER, CA=DEFAULT_CA):
                 raise ValueError("Error checking challenge: {0} {1}".format(
                     e.code, json.loads(e.read().decode('utf8'))))
             if challenge_status['status'] == "pending":
-                time.sleep(2)
+                log.info("Spinning on challenge responce")
+                time.sleep(SYNC_WAIT_TIME)
             elif challenge_status['status'] == "valid":
                 log.info("{0} verified!".format(domain))
                 os.remove(wellknown_path)
@@ -170,21 +182,32 @@ def main(argv):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=textwrap.dedent("""\
             This script automates the process of getting a signed TLS certificate from
-            Let's Encrypt using the ACME protocol. It will need to be run on your server
-            and have access to your private account key, so PLEASE READ THROUGH IT! It's
-            only ~200 lines, so it won't take long.
+            Let's Encrypt using the ACME protocol.
 
-            ===Example Usage===
+            The acme-challenge folder should be accessiable or quickly synced to your
+            domain on http://domain.example.com/.well-known/acme-challenge/
+            E.G: 
+                 { for ipos in $(seq 1 40) ; do \
+                 rsync -e 'ssh' -rtcW --delete \
+                 ./acme-challenge/ \
+                 acme@domain.example.com:/html-root/.well-known/acme-challenge/ ; \
+                 sleep 10 ; done ; } &
+            
+            This script has access to that private keyring and performs actions for you,
+            PLEASE READ THROUGH IT!  It's about 200 lines, so it won't take long.
+
+            ===Example Standalone Usage===
             python acme_tiny.py --account-key ./account.key --csr ./domain.csr --acme-dir /usr/share/nginx/html/.well-known/acme-challenge/ > signed.crt
             ===================
 
-            ===Example Crontab Renewal (once per month)===
+            ===Example Standalone Crontab Renewal (once per month)===
             0 0 1 * * python /path/to/acme_tiny.py --account-key /path/to/account.key --csr /path/to/domain.csr --acme-dir /usr/share/nginx/html/.well-known/acme-challenge/ > /path/to/signed.crt 2>> /var/log/acme_tiny.log
             ==============================================
             """)
     )
     parser.add_argument("--account-key", required=True, help="path to your Let's Encrypt account private key")
     parser.add_argument("--csr", required=True, help="path to your certificate signing request")
+    parser.add_argument("--crt", required=False, help="path to your certificate output file")
     parser.add_argument("--acme-dir", required=True, help="path to the .well-known/acme-challenge/ directory")
     parser.add_argument("--quiet", action="store_const", const=logging.ERROR, help="suppress output except for errors")
     parser.add_argument("--ca", default=DEFAULT_CA, help="certificate authority, default is Let's Encrypt")
@@ -192,6 +215,12 @@ def main(argv):
     args = parser.parse_args(argv)
     LOGGER.setLevel(args.quiet or LOGGER.level)
     signed_crt = get_crt(args.account_key, args.csr, args.acme_dir, log=LOGGER, CA=args.ca)
+    try:
+    	if args.crt is not None:
+            with open(args.crt, "w") as crt:
+                crt.write(signed_crt)
+    except (Exception, ) as e:
+        pass
     sys.stdout.write(signed_crt)
 
 if __name__ == "__main__": # pragma: no cover
